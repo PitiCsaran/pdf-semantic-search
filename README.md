@@ -12,10 +12,31 @@ A browser-based semantic search tool for PDF presentations. Upload a PDF and a s
 - Two model variants: L12-v2 (fast, ~118 MB) and LaBSE (highest quality, ~470 MB)
 - Fully browser-based — no backend, no Python packages required
 
+## Before You Start — Preparing Your Excel File
+
+> **v1 does not extract content from the PDF automatically.**
+> You must prepare the Excel file yourself before using this app.
+
+This is intentional. In organizational settings, PDF documents may contain sensitive or confidential information. Extracting and summarizing content with an AI tool should go through your **organization's approved generative AI** to comply with data governance and acceptable-use policies.
+
+**Recommended workflow:**
+
+1. Open your PDF presentation
+2. Use your organization's approved generative AI tool (e.g. **Microsoft Copilot**, or another sanctioned tool) to read each slide and produce a summary table with:
+   - The page number
+   - A short topic label
+   - A detailed description of the slide content
+3. Paste the output into the Excel template (download it from within the app)
+4. Upload both the PDF and the completed Excel to this app
+
+This ensures that all AI-assisted content extraction happens within your organization's approved environment, while this app handles only the local search and retrieval — entirely on your own machine with no data sent externally.
+
+---
+
 ## How It Works
 
 1. Upload a PDF (e.g. a slide deck) and an Excel file with columns: `Page Number`, `Topic`, `Detail`
-2. The app computes semantic embeddings for each row
+2. The app computes semantic embeddings for each row — locally, on your machine
 3. Type a natural language query — results are ranked by similarity
 4. Click any result row to view that slide in the PDF viewer panel
 5. Sessions are auto-saved so you can resume instantly next time
