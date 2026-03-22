@@ -1,0 +1,12 @@
+# Model files — large binaries, downloaded via download_model.bat
+v1/L12-v2/model/
+v1/LaBSE/model/
+v2/**/model/
+
+# User session data
+*.pdf
+session.json
+
+# OS artifacts
+.DS_Store
+Thumbs.db
