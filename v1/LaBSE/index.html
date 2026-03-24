@@ -16,7 +16,7 @@
     <span class="app-title">PDF Semantic Search</span>
     <span class="model-badge" id="modelBadge">Loading model…</span>
   </div>
-  <button class="btn-sessions" id="btnSessions">📁 Sessions</button>
+  <button class="btn-sessions" id="btnSessions">Sessions</button>
 </header>
 
 <!-- ── MAIN SPLIT LAYOUT ──────────────────────────────────── -->
@@ -28,14 +28,14 @@
     <!-- Upload + status -->
     <div class="upload-bar">
       <label class="btn-upload" title="Upload PDF">
-        📄 Upload PDF
+        Upload PDF
         <input type="file" id="inputPdf" accept=".pdf" hidden />
       </label>
       <label class="btn-upload" title="Upload Excel">
-        📊 Upload Excel
+        Upload Excel
         <input type="file" id="inputExcel" accept=".xlsx,.xls" hidden />
       </label>
-      <button class="btn-template" id="btnTemplate">⬇ Template</button>
+      <button class="btn-template" id="btnTemplate">Template</button>
     </div>
     <div class="status-bar" id="statusBar">
       <span class="status-dot pending" id="statusDot"></span>
@@ -44,7 +44,7 @@
 
     <!-- Search -->
     <div class="search-bar">
-      <input type="text" id="searchInput" placeholder="Type a search query…" disabled />
+      <input type="text" id="searchInput" placeholder="Search slides…" disabled />
       <button id="btnSearch" disabled>Search</button>
     </div>
 
@@ -93,15 +93,17 @@
   <!-- RIGHT PANEL — PDF viewer -->
   <div class="right-panel" id="rightPanel">
     <div class="pdf-toolbar">
-      <button id="btnPrev" disabled>◀</button>
-      <span id="pageInfo">— / —</span>
-      <button id="btnNext" disabled>▶</button>
+      <button id="btnToggleThumbs" title="Toggle thumbnail panel">&#9776;</button>
       <span class="spacer"></span>
-      <button id="btnFullscreen" title="Full screen">⛶</button>
+      <span id="pageInfo" class="page-info" title="Click to jump to page">&#8212; / &#8212;</span>
+      <span class="spacer"></span>
+      <button id="btnFullscreen" title="Full screen" disabled>&#9974;</button>
     </div>
-    <div class="pdf-canvas-wrap" id="pdfCanvasWrap">
-      <canvas id="pdfCanvas"></canvas>
-      <div class="pdf-placeholder" id="pdfPlaceholder">PDF viewer — upload a PDF to begin</div>
+    <div class="pdf-viewer-body" id="pdfViewerBody">
+      <div class="thumbnail-strip" id="thumbnailStrip"></div>
+      <div class="pdf-scroll-view" id="pdfScrollView">
+        <div class="pdf-placeholder" id="pdfPlaceholder">PDF viewer — upload a PDF to begin</div>
+      </div>
     </div>
   </div>
 </div>
@@ -109,11 +111,11 @@
 <!-- ── FULLSCREEN OVERLAY ─────────────────────────────────── -->
 <div class="fullscreen-overlay" id="fullscreenOverlay" style="display:none">
   <div class="fs-toolbar">
-    <button id="fsBtnPrev">◀</button>
-    <span id="fsPageInfo">— / —</span>
-    <button id="fsBtnNext">▶</button>
+    <button id="fsBtnPrev">&#9664;</button>
+    <span id="fsPageInfo">&#8212; / &#8212;</span>
+    <button id="fsBtnNext">&#9654;</button>
     <span class="spacer"></span>
-    <button id="fsBtnClose">✕ Exit Full Screen</button>
+    <button id="fsBtnClose">&#x2715; Exit Full Screen</button>
   </div>
   <div class="fs-canvas-wrap">
     <canvas id="fsCanvas"></canvas>
@@ -125,11 +127,11 @@
   <div class="modal">
     <div class="modal-header">
       <span>Sessions</span>
-      <button class="modal-close" id="btnCloseModal">✕</button>
+      <button class="modal-close" id="btnCloseModal">&#x2715;</button>
     </div>
     <div class="modal-body">
       <div class="session-actions">
-        <button id="btnSetFolder">📁 Set Session Folder</button>
+        <button id="btnSetFolder">Set Session Folder</button>
         <span class="folder-hint" id="folderHint">No folder selected</span>
       </div>
       <div id="sessionList" class="session-list">
@@ -139,7 +141,7 @@
   </div>
 </div>
 
-<!-- ── WARNING TOAST ──────────────────────────────────────── -->
+<!-- ── TOAST ──────────────────────────────────────────────── -->
 <div class="toast" id="toast" style="display:none"></div>
 
 <script type="module" src="app.js"></script>

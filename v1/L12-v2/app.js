@@ -11,54 +11,63 @@ env.localModelPath       = './model/';
 env.allowRemoteModels    = false;
 env.backends.onnx.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/';
 
+// ─── CONSTANTS ───────────────────────────────────────────────────────────────
+const MAIN_SCALE  = 1.5;
+const THUMB_SCALE = 0.15;
+
 // ─── GLOBALS ─────────────────────────────────────────────────────────────────
 let embedder       = null;
 let pdfDoc         = null;
 let currentPage    = 1;
 let totalPages     = 0;
-let rows           = [];          // normalized row objects with embeddings
+let rows           = [];
+let pageWrappers   = [];   // [{ wrapper, canvas, rendered }]
+let scrollObserver = null;
+let renderObserver = null;
+let thumbObserver  = null;
 let sessionDirHandle = null;
 const IDB_STORE    = 'session-handle';
 const IDB_KEY      = 'dirHandle';
 const LS_HISTORY   = `pss-history-${APP_PORT}`;
 
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
-const inputPdf      = document.getElementById('inputPdf');
-const inputExcel    = document.getElementById('inputExcel');
-const btnTemplate   = document.getElementById('btnTemplate');
-const statusDot     = document.getElementById('statusDot');
-const statusText    = document.getElementById('statusText');
-const modelBadge    = document.getElementById('modelBadge');
-const searchInput   = document.getElementById('searchInput');
-const btnSearch     = document.getElementById('btnSearch');
-const topNSelect    = document.getElementById('topNSelect');
-const scoreSlider   = document.getElementById('scoreSlider');
-const scoreVal      = document.getElementById('scoreVal');
-const progressWrap  = document.getElementById('progressWrap');
-const progressBar   = document.getElementById('progressBar');
-const progressText  = document.getElementById('progressText');
-const resultsBody   = document.getElementById('resultsBody');
-const noResults     = document.getElementById('noResults');
-const historyChips  = document.getElementById('historyChips');
-const pdfCanvas     = document.getElementById('pdfCanvas');
-const fsCanvas      = document.getElementById('fsCanvas');
-const pdfPlaceholder = document.getElementById('pdfPlaceholder');
-const pageInfo      = document.getElementById('pageInfo');
-const fsPageInfo    = document.getElementById('fsPageInfo');
-const btnPrev       = document.getElementById('btnPrev');
-const btnNext       = document.getElementById('btnNext');
-const fsBtnPrev     = document.getElementById('fsBtnPrev');
-const fsBtnNext     = document.getElementById('fsBtnNext');
-const btnFullscreen = document.getElementById('btnFullscreen');
-const fsBtnClose    = document.getElementById('fsBtnClose');
+const inputPdf          = document.getElementById('inputPdf');
+const inputExcel        = document.getElementById('inputExcel');
+const btnTemplate       = document.getElementById('btnTemplate');
+const statusDot         = document.getElementById('statusDot');
+const statusText        = document.getElementById('statusText');
+const modelBadge        = document.getElementById('modelBadge');
+const searchInput       = document.getElementById('searchInput');
+const btnSearch         = document.getElementById('btnSearch');
+const topNSelect        = document.getElementById('topNSelect');
+const scoreSlider       = document.getElementById('scoreSlider');
+const scoreVal          = document.getElementById('scoreVal');
+const progressWrap      = document.getElementById('progressWrap');
+const progressBar       = document.getElementById('progressBar');
+const progressText      = document.getElementById('progressText');
+const resultsBody       = document.getElementById('resultsBody');
+const noResults         = document.getElementById('noResults');
+const historyChips      = document.getElementById('historyChips');
+const fsCanvas          = document.getElementById('fsCanvas');
+const pdfPlaceholder    = document.getElementById('pdfPlaceholder');
+const pageInfo          = document.getElementById('pageInfo');
+const fsPageInfo        = document.getElementById('fsPageInfo');
+const fsBtnPrev         = document.getElementById('fsBtnPrev');
+const fsBtnNext         = document.getElementById('fsBtnNext');
+const btnFullscreen     = document.getElementById('btnFullscreen');
+const fsBtnClose        = document.getElementById('fsBtnClose');
 const fullscreenOverlay = document.getElementById('fullscreenOverlay');
-const sessionsModal = document.getElementById('sessionsModal');
-const btnSessions   = document.getElementById('btnSessions');
-const btnCloseModal = document.getElementById('btnCloseModal');
-const btnSetFolder  = document.getElementById('btnSetFolder');
-const folderHint    = document.getElementById('folderHint');
-const sessionList   = document.getElementById('sessionList');
-const toast         = document.getElementById('toast');
+const btnToggleThumbs   = document.getElementById('btnToggleThumbs');
+const pdfViewerBody     = document.getElementById('pdfViewerBody');
+const thumbnailStrip    = document.getElementById('thumbnailStrip');
+const pdfScrollView     = document.getElementById('pdfScrollView');
+const sessionsModal     = document.getElementById('sessionsModal');
+const btnSessions       = document.getElementById('btnSessions');
+const btnCloseModal     = document.getElementById('btnCloseModal');
+const btnSetFolder      = document.getElementById('btnSetFolder');
+const folderHint        = document.getElementById('folderHint');
+const sessionList       = document.getElementById('sessionList');
+const toast             = document.getElementById('toast');
 
 // ─── STATUS HELPERS ───────────────────────────────────────────────────────────
 function setStatus(msg, state = 'ready') {
@@ -81,8 +90,8 @@ function updateProgress(i, total) {
 
 function checkSearchReady() {
   const ready = embedder && pdfDoc && rows.length > 0;
-  searchInput.disabled  = !ready;
-  btnSearch.disabled    = !ready;
+  searchInput.disabled = !ready;
+  btnSearch.disabled   = !ready;
   if (ready) setStatus(`Ready — ${totalPages} pages, ${rows.length} rows`, 'ready');
 }
 
@@ -167,7 +176,6 @@ inputExcel.addEventListener('change', async e => {
     score:      0,
   }));
 
-  // Compute embeddings with progress
   progressWrap.style.display = 'block';
   setStatus('Computing embeddings…', 'loading');
   for (let i = 0; i < rows.length; i++) {
@@ -179,7 +187,6 @@ inputExcel.addEventListener('change', async e => {
   progressWrap.style.display = 'none';
   checkSearchReady();
 
-  // Auto-save session if folder is set
   if (sessionDirHandle && pdfDoc && currentPdfFile) {
     await saveSession(currentPdfFile);
   }
@@ -200,44 +207,206 @@ async function loadPDF(file) {
   pdfDoc = await pdfjsLib.getDocument({ data: ab }).promise;
   totalPages = pdfDoc.numPages;
   pdfPlaceholder.style.display = 'none';
-  btnPrev.disabled  = false;
-  btnNext.disabled  = false;
   btnFullscreen.disabled = false;
-  await renderPage(1);
+  await setupScrollView();
+  await renderAllThumbnails();
+  navigateToPage(1, false);
   checkSearchReady();
 }
 
-// ─── PDF RENDERING ────────────────────────────────────────────────────────────
-async function renderPage(pageNum, targetCanvas = pdfCanvas, scale = 1.5) {
-  if (!pdfDoc) return;
-  currentPage = Math.max(1, Math.min(pageNum, totalPages));
-  const page = await pdfDoc.getPage(currentPage);
-  const viewport = page.getViewport({ scale });
-  targetCanvas.width  = viewport.width;
-  targetCanvas.height = viewport.height;
-  await page.render({ canvasContext: targetCanvas.getContext('2d'), viewport }).promise;
-  const info = `Page ${currentPage} of ${totalPages}`;
-  pageInfo.textContent   = info;
-  fsPageInfo.textContent = info;
-  btnPrev.disabled = currentPage <= 1;
-  btnNext.disabled = currentPage >= totalPages;
-  fsBtnPrev.disabled = currentPage <= 1;
-  fsBtnNext.disabled = currentPage >= totalPages;
+// ─── PDF SCROLL VIEW SETUP ────────────────────────────────────────────────────
+async function setupScrollView() {
+  if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+  if (renderObserver) { renderObserver.disconnect(); renderObserver = null; }
+
+  pdfScrollView.innerHTML = '';
+  pageWrappers = [];
+
+  // Track which page is most visible → update page info + thumbnail highlight
+  scrollObserver = new IntersectionObserver(entries => {
+    let best = null, bestRatio = 0;
+    entries.forEach(e => {
+      if (e.isIntersecting && e.intersectionRatio > bestRatio) {
+        bestRatio = e.intersectionRatio;
+        best = e.target;
+      }
+    });
+    if (best) {
+      const p = parseInt(best.dataset.page);
+      if (p !== currentPage) {
+        currentPage = p;
+        updatePageInfo();
+        highlightThumb(currentPage);
+        syncThumbScroll(currentPage);
+      }
+    }
+  }, { root: pdfScrollView, threshold: [0.1, 0.3, 0.5, 0.7] });
+
+  // Lazy-render pages as they approach the viewport
+  renderObserver = new IntersectionObserver(async entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const i = parseInt(e.target.dataset.page) - 1;
+      const pw = pageWrappers[i];
+      if (pw && !pw.rendered) {
+        pw.rendered = true;
+        await renderPageToCanvas(i + 1, pw.canvas, MAIN_SCALE);
+      }
+    }
+  }, { root: pdfScrollView, rootMargin: '400px' });
+
+  // Use first page dimensions as placeholder size for all canvases
+  const firstPage = await pdfDoc.getPage(1);
+  const firstVP   = firstPage.getViewport({ scale: MAIN_SCALE });
+
+  for (let p = 1; p <= totalPages; p++) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'page-wrapper';
+    wrapper.dataset.page = p;
+    const canvas = document.createElement('canvas');
+    canvas.width  = firstVP.width;
+    canvas.height = firstVP.height;
+    wrapper.appendChild(canvas);
+    pdfScrollView.appendChild(wrapper);
+    pageWrappers.push({ wrapper, canvas, rendered: false });
+    scrollObserver.observe(wrapper);
+    renderObserver.observe(wrapper);
+  }
 }
 
-btnPrev.addEventListener('click', () => renderPage(currentPage - 1));
-btnNext.addEventListener('click', () => renderPage(currentPage + 1));
-fsBtnPrev.addEventListener('click', () => { renderPage(currentPage - 1); renderPage(currentPage - 1, fsCanvas, 1.8); });
-fsBtnNext.addEventListener('click', () => { renderPage(currentPage + 1); renderPage(currentPage + 1, fsCanvas, 1.8); });
+// ─── THUMBNAIL STRIP ──────────────────────────────────────────────────────────
+async function renderAllThumbnails() {
+  if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
+  thumbnailStrip.innerHTML = '';
+
+  // Lazy-render thumbnails as they scroll into view in the strip
+  thumbObserver = new IntersectionObserver(async entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting || e.target.dataset.rendered) continue;
+      e.target.dataset.rendered = '1';
+      const p      = parseInt(e.target.dataset.page);
+      const canvas = e.target.querySelector('canvas');
+      await renderPageToCanvas(p, canvas, THUMB_SCALE);
+    }
+  }, { root: thumbnailStrip, rootMargin: '300px' });
+
+  for (let p = 1; p <= totalPages; p++) {
+    const item   = document.createElement('div');
+    item.className = 'thumb-item';
+    item.dataset.page = p;
+    const canvas = document.createElement('canvas');
+    const label  = document.createElement('span');
+    label.textContent = p;
+    item.appendChild(canvas);
+    item.appendChild(label);
+    item.addEventListener('click', () => navigateToPage(p));
+    thumbnailStrip.appendChild(item);
+    thumbObserver.observe(item);
+  }
+}
+
+// ─── SHARED RENDER HELPER ────────────────────────────────────────────────────
+async function renderPageToCanvas(pageNum, canvas, scale) {
+  const page = await pdfDoc.getPage(pageNum);
+  const vp   = page.getViewport({ scale });
+  canvas.width  = vp.width;
+  canvas.height = vp.height;
+  await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+}
+
+// ─── PAGE NAVIGATION ──────────────────────────────────────────────────────────
+function navigateToPage(pageNum, smooth = true) {
+  if (!pdfDoc || !pageWrappers.length) return;
+  currentPage = Math.max(1, Math.min(pageNum, totalPages));
+  const wrapper = pageWrappers[currentPage - 1].wrapper;
+  // Scroll within the pdfScrollView container directly
+  const containerRect = pdfScrollView.getBoundingClientRect();
+  const wrapperRect   = wrapper.getBoundingClientRect();
+  const offset = wrapperRect.top - containerRect.top + pdfScrollView.scrollTop - 16;
+  pdfScrollView.scrollTo({ top: offset, behavior: smooth ? 'smooth' : 'instant' });
+  updatePageInfo();
+  highlightThumb(currentPage);
+  syncThumbScroll(currentPage);
+}
+
+function updatePageInfo() {
+  if (!pageInfo.isConnected) return; // input is showing instead
+  pageInfo.textContent = `${currentPage} / ${totalPages}`;
+}
+
+function highlightThumb(pageNum) {
+  thumbnailStrip.querySelectorAll('.thumb-item').forEach(el => el.classList.remove('active'));
+  const active = thumbnailStrip.querySelector(`.thumb-item[data-page="${pageNum}"]`);
+  if (active) active.classList.add('active');
+}
+
+function syncThumbScroll(pageNum) {
+  const t = thumbnailStrip.querySelector(`.thumb-item[data-page="${pageNum}"]`);
+  if (!t) return;
+  const cr = thumbnailStrip.getBoundingClientRect();
+  const tr = t.getBoundingClientRect();
+  const offset = tr.top - cr.top + thumbnailStrip.scrollTop - thumbnailStrip.clientHeight / 2;
+  thumbnailStrip.scrollTo({ top: offset, behavior: 'smooth' });
+}
+
+// ─── EDITABLE PAGE NUMBER ─────────────────────────────────────────────────────
+pageInfo.addEventListener('click', () => {
+  if (!pdfDoc) return;
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min  = 1;
+  input.max  = totalPages;
+  input.value = currentPage;
+  input.className = 'page-input-edit';
+  pageInfo.replaceWith(input);
+  input.focus();
+  input.select();
+
+  const commit = () => {
+    const n = parseInt(input.value);
+    input.replaceWith(pageInfo);
+    if (n >= 1 && n <= totalPages) navigateToPage(n);
+    else updatePageInfo();
+  };
+  input.addEventListener('blur', commit);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    if (e.key === 'Escape') { input.replaceWith(pageInfo); updatePageInfo(); }
+  });
+});
+
+// ─── THUMBNAIL TOGGLE ─────────────────────────────────────────────────────────
+btnToggleThumbs.addEventListener('click', () => {
+  pdfViewerBody.classList.toggle('thumbs-hidden');
+});
 
 // ─── FULLSCREEN ───────────────────────────────────────────────────────────────
 btnFullscreen.addEventListener('click', async () => {
   fullscreenOverlay.style.display = 'flex';
-  await renderPage(currentPage, fsCanvas, 1.8);
+  fsBtnPrev.disabled = currentPage <= 1;
+  fsBtnNext.disabled = currentPage >= totalPages;
+  fsPageInfo.textContent = `${currentPage} / ${totalPages}`;
+  await renderPageToCanvas(currentPage, fsCanvas, 1.8);
 });
+
 fsBtnClose.addEventListener('click', () => {
   fullscreenOverlay.style.display = 'none';
 });
+
+async function fsNavigate(delta) {
+  const next = Math.max(1, Math.min(currentPage + delta, totalPages));
+  if (next === currentPage) return;
+  currentPage = next;
+  fsBtnPrev.disabled = currentPage <= 1;
+  fsBtnNext.disabled = currentPage >= totalPages;
+  fsPageInfo.textContent = `${currentPage} / ${totalPages}`;
+  await renderPageToCanvas(currentPage, fsCanvas, 1.8);
+  updatePageInfo();
+  highlightThumb(currentPage);
+}
+
+fsBtnPrev.addEventListener('click', () => fsNavigate(-1));
+fsBtnNext.addEventListener('click', () => fsNavigate(1));
 
 // ─── KEYBOARD SHORTCUTS ───────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
@@ -245,12 +414,13 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && inInput) { runSearch(); return; }
   if (e.key === 'Escape') { fullscreenOverlay.style.display = 'none'; return; }
   if (!inInput) {
-    if (e.key === 'ArrowLeft')  { renderPage(currentPage - 1); if (fullscreenOverlay.style.display !== 'none') renderPage(currentPage, fsCanvas, 1.8); }
-    if (e.key === 'ArrowRight') { renderPage(currentPage + 1); if (fullscreenOverlay.style.display !== 'none') renderPage(currentPage, fsCanvas, 1.8); }
+    const isFS = fullscreenOverlay.style.display !== 'none';
+    if (e.key === 'ArrowLeft')  { if (isFS) fsNavigate(-1); else navigateToPage(currentPage - 1); }
+    if (e.key === 'ArrowRight') { if (isFS) fsNavigate(1);  else navigateToPage(currentPage + 1); }
   }
 });
 
-// G+number jump: accumulate digits typed outside input
+// Digit accumulation → jump to page (when outside search input)
 let jumpBuffer = '';
 let jumpTimer  = null;
 document.addEventListener('keydown', e => {
@@ -260,7 +430,7 @@ document.addEventListener('keydown', e => {
     clearTimeout(jumpTimer);
     jumpTimer = setTimeout(() => {
       const n = parseInt(jumpBuffer, 10);
-      if (n >= 1 && n <= totalPages) renderPage(n);
+      if (n >= 1 && n <= totalPages) navigateToPage(n);
       jumpBuffer = '';
     }, 800);
   }
@@ -304,7 +474,6 @@ async function runSearch() {
     r.rawScore = 0.7 * sem + 0.3 * kw;
   });
 
-  // Min-max normalization (guard against single row)
   const scores = rows.map(r => r.rawScore);
   const min = Math.min(...scores), max = Math.max(...scores);
   const range = max - min;
@@ -329,7 +498,7 @@ function renderTable(sorted) {
     const tr = document.createElement('tr');
     tr.dataset.page = row.pageNumber;
 
-    const scorePct = Math.round(row.score * 100);
+    const scorePct   = Math.round(row.score * 100);
     const badgeClass = scorePct >= 80 ? 'score-green' : scorePct >= 60 ? 'score-yellow' : 'score-gray';
 
     tr.innerHTML = `
@@ -339,14 +508,12 @@ function renderTable(sorted) {
       <td><span class="score-badge ${badgeClass}">${scorePct}%</span></td>
     `;
 
-    // Click row → navigate PDF
-    tr.addEventListener('click', async () => {
+    tr.addEventListener('click', () => {
       document.querySelectorAll('#resultsBody tr').forEach(t => t.classList.remove('active'));
       tr.classList.add('active');
-      await renderPage(row.pageNumber);
+      navigateToPage(row.pageNumber);
     });
 
-    // Click detail cell to expand
     tr.querySelector('.detail-cell').addEventListener('click', e => {
       e.stopPropagation();
       e.currentTarget.classList.toggle('collapsed');
@@ -360,7 +527,6 @@ function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// Re-render on filter change
 scoreSlider.addEventListener('input', () => {
   scoreVal.textContent = scoreSlider.value + '%';
   if (rows.some(r => r.score !== 0)) renderTable([...rows].sort((a, b) => b.score - a.score));
@@ -395,8 +561,6 @@ function renderHistory() {
 }
 
 // ─── SESSION FOLDER (File System Access API) ─────────────────────────────────
-
-// Open IndexedDB
 function openIDB() {
   return new Promise((res, rej) => {
     const req = indexedDB.open('pss-sessions', 1);
@@ -436,7 +600,7 @@ async function tryRestoreSessionFolder() {
       folderHint.textContent = handle.name;
       await loadSessionList();
     }
-  } catch { /* permission denied or handle stale */ }
+  } catch { /* permission denied or stale handle */ }
 }
 
 btnSetFolder.addEventListener('click', async () => {
@@ -455,12 +619,10 @@ async function saveSession(pdfFile) {
   const name = `${base}_${date}`;
   try {
     const subDir = await sessionDirHandle.getDirectoryHandle(name, { create: true });
-    // Save PDF
     const pdfHandle = await subDir.getFileHandle(pdfFile.name, { create: true });
     const pdfWriter = await pdfHandle.createWritable();
     await pdfWriter.write(pdfFile);
     await pdfWriter.close();
-    // Save session.json
     const jsonHandle = await subDir.getFileHandle('session.json', { create: true });
     const jsonWriter = await jsonHandle.createWritable();
     await jsonWriter.write(JSON.stringify({
@@ -510,18 +672,16 @@ function renderSessionCards(sessions) {
         <span class="session-model">${entry.meta.modelId || ''}</span>
       </div>
       <div class="session-btns">
-        <button class="btn-rename" title="Rename">✏</button>
-        <button class="btn-load">▶ Load</button>
+        <button class="btn-rename" title="Rename">&#9998;</button>
+        <button class="btn-load">&#9654; Load</button>
       </div>
     `;
 
-    // Load
     card.querySelector('.btn-load').addEventListener('click', async () => {
       await resumeSession(entry);
       sessionsModal.style.display = 'none';
     });
 
-    // Rename
     card.querySelector('.btn-rename').addEventListener('click', async () => {
       const nameEl = card.querySelector('.session-name');
       const old = nameEl.textContent;
@@ -535,8 +695,6 @@ function renderSessionCards(sessions) {
         const newName = input.value.trim();
         if (newName && newName !== old) {
           try {
-            // Move by copying then deleting is not directly supported;
-            // we rename by creating new subdir, moving files, deleting old
             const newDir = await sessionDirHandle.getDirectoryHandle(newName, { create: true });
             for await (const [fname, fhandle] of entry.handle.entries()) {
               if (fhandle.kind !== 'file') continue;
@@ -554,8 +712,11 @@ function renderSessionCards(sessions) {
           input.replaceWith(nameEl);
         }
       };
-      input.addEventListener('blur',  commit);
-      input.addEventListener('keydown', e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') input.replaceWith(nameEl); });
+      input.addEventListener('blur', commit);
+      input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') commit();
+        if (e.key === 'Escape') input.replaceWith(nameEl);
+      });
     });
 
     sessionList.appendChild(card);
@@ -564,7 +725,7 @@ function renderSessionCards(sessions) {
 
 async function resumeSession(entry) {
   if (entry.meta.modelId && entry.meta.modelId !== MODEL_ID) {
-    showToast(`⚠ Session created with ${entry.meta.modelId}. Search scores may be inaccurate.`, true);
+    showToast(`Session created with ${entry.meta.modelId}. Search scores may be inaccurate.`, true);
   }
   try {
     const pdfFile = await (await entry.handle.getFileHandle(entry.meta.pdfFilename)).getFile();
@@ -576,7 +737,6 @@ async function resumeSession(entry) {
   } catch (e) { showToast('Failed to load session: ' + e.message, true); }
 }
 
-// Sessions modal
 btnSessions.addEventListener('click', () => { sessionsModal.style.display = 'flex'; });
 btnCloseModal.addEventListener('click', () => { sessionsModal.style.display = 'none'; });
 sessionsModal.addEventListener('click', e => { if (e.target === sessionsModal) sessionsModal.style.display = 'none'; });
