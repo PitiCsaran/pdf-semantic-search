@@ -1,13 +1,13 @@
 @echo off
 setlocal
-set MODEL=paraphrase-multilingual-MiniLM-L12-v2
+set MODEL=LaBSE
 set BASE_URL=https://huggingface.co/Xenova/%MODEL%/resolve/main
 set OUT=model\Xenova\%MODEL%
 
 echo ============================================
 echo  Downloading model: %MODEL%
-echo  This may take ~1-2 minutes depending on
-echo  your internet connection (~118 MB total).
+echo  This may take ~5-10 minutes depending on
+echo  your internet connection (~470 MB total).
 echo ============================================
 echo.
 
