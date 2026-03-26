@@ -25,7 +25,6 @@
   <!-- LEFT PANEL -->
   <div class="left-panel">
 
-    <!-- Upload + status -->
     <div class="upload-bar">
       <label class="btn-upload" title="Upload PDF">
         Upload PDF
@@ -37,21 +36,18 @@
       </label>
       <button class="btn-template" id="btnTemplate">Template</button>
     </div>
-    <div class="status-bar" id="statusBar">
+    <div class="status-bar">
       <span class="status-dot pending" id="statusDot"></span>
       <span id="statusText">Loading model, please wait…</span>
     </div>
 
-    <!-- Search -->
     <div class="search-bar">
       <input type="text" id="searchInput" placeholder="Search slides…" disabled />
       <button id="btnSearch" disabled>Search</button>
     </div>
 
-    <!-- Search history chips -->
     <div class="history-chips" id="historyChips"></div>
 
-    <!-- Filters -->
     <div class="filter-bar">
       <label>Show:
         <select id="topNSelect">
@@ -67,13 +63,11 @@
       </label>
     </div>
 
-    <!-- Progress bar (hidden by default) -->
     <div class="progress-wrap" id="progressWrap" style="display:none">
       <div class="progress-bar" id="progressBar"></div>
       <span class="progress-text" id="progressText">Embedding row 0 of 0</span>
     </div>
 
-    <!-- Results table -->
     <div class="table-wrap">
       <table id="resultsTable">
         <thead>
@@ -93,9 +87,14 @@
   <!-- RIGHT PANEL — PDF viewer -->
   <div class="right-panel" id="rightPanel">
     <div class="pdf-toolbar">
-      <button id="btnToggleThumbs" title="Toggle thumbnail panel">&#9776;</button>
+      <button id="btnToggleThumbs" title="Toggle thumbnails">&#9776;</button>
+      <span class="toolbar-sep"></span>
+      <button id="btnZoomOut" title="Zoom out" disabled>&#8722;</button>
+      <span id="zoomDisplay" class="zoom-display">100%</span>
+      <button id="btnZoomIn" title="Zoom in" disabled>&#43;</button>
+      <button id="btnZoomFit" title="Fit to width" class="btn-zoom-fit" disabled>Fit</button>
       <span class="spacer"></span>
-      <span id="pageInfo" class="page-info" title="Click to jump to page">&#8212; / &#8212;</span>
+      <span id="pageInfo" class="page-info" title="Click to jump to page">&#8212;&nbsp;/&nbsp;&#8212;</span>
       <span class="spacer"></span>
       <button id="btnFullscreen" title="Full screen" disabled>&#9974;</button>
     </div>
@@ -112,7 +111,7 @@
 <div class="fullscreen-overlay" id="fullscreenOverlay" style="display:none">
   <div class="fs-toolbar">
     <button id="fsBtnPrev">&#9664;</button>
-    <span id="fsPageInfo">&#8212; / &#8212;</span>
+    <span id="fsPageInfo">&#8212;&nbsp;/&nbsp;&#8212;</span>
     <button id="fsBtnNext">&#9654;</button>
     <span class="spacer"></span>
     <button id="fsBtnClose">&#x2715; Exit Full Screen</button>
@@ -141,9 +140,8 @@
   </div>
 </div>
 
-<!-- ── TOAST ──────────────────────────────────────────────── -->
 <div class="toast" id="toast" style="display:none"></div>
 
-<script type="module" src="app.js"></script>
+<script type="module" src="app.js?v=3"></script>
 </body>
 </html>

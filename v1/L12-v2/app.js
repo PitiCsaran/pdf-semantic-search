@@ -6,29 +6,32 @@ const APP_PORT   = 8080;
 // ─── IMPORTS ─────────────────────────────────────────────────────────────────
 import { pipeline, env } from './libs/transformers.min.js';
 
-// Use local model files; load WASM runtime from CDN (cached after first use)
 env.localModelPath       = './model/';
 env.allowRemoteModels    = false;
 env.backends.onnx.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/';
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
-const MAIN_SCALE  = 1.5;
-const THUMB_SCALE = 0.15;
+const THUMB_SCALE  = 0.15;
+const ZOOM_STEP    = 1.25;
+const ZOOM_MIN     = 0.25;
+const ZOOM_MAX     = 5.0;
 
 // ─── GLOBALS ─────────────────────────────────────────────────────────────────
-let embedder       = null;
-let pdfDoc         = null;
-let currentPage    = 1;
-let totalPages     = 0;
-let rows           = [];
-let pageWrappers   = [];   // [{ wrapper, canvas, rendered }]
-let scrollObserver = null;
-let renderObserver = null;
-let thumbObserver  = null;
+let embedder         = null;
+let pdfDoc           = null;
+let currentPage      = 1;
+let totalPages       = 0;
+let rows             = [];
+let pageWrappers     = [];   // [{ wrapper, canvas, rendered }]
+let currentScale     = 1.5;
+let basePageWidth    = 0;    // page width at scale 1.0 (pts)
+let basePageHeight   = 0;
+let thumbRenderTask  = null; // cancellation token
+let pageRenderTask   = null;
 let sessionDirHandle = null;
-const IDB_STORE    = 'session-handle';
-const IDB_KEY      = 'dirHandle';
-const LS_HISTORY   = `pss-history-${APP_PORT}`;
+const IDB_STORE      = 'session-handle';
+const IDB_KEY        = 'dirHandle';
+const LS_HISTORY     = `pss-history-${APP_PORT}`;
 
 // ─── DOM REFS ─────────────────────────────────────────────────────────────────
 const inputPdf          = document.getElementById('inputPdf');
@@ -61,6 +64,10 @@ const btnToggleThumbs   = document.getElementById('btnToggleThumbs');
 const pdfViewerBody     = document.getElementById('pdfViewerBody');
 const thumbnailStrip    = document.getElementById('thumbnailStrip');
 const pdfScrollView     = document.getElementById('pdfScrollView');
+const btnZoomIn         = document.getElementById('btnZoomIn');
+const btnZoomOut        = document.getElementById('btnZoomOut');
+const btnZoomFit        = document.getElementById('btnZoomFit');
+const zoomDisplay       = document.getElementById('zoomDisplay');
 const sessionsModal     = document.getElementById('sessionsModal');
 const btnSessions       = document.getElementById('btnSessions');
 const btnCloseModal     = document.getElementById('btnCloseModal');
@@ -114,12 +121,10 @@ function dotProduct(a, b) {
   for (let i = 0; i < a.length; i++) s += a[i] * b[i];
   return s;
 }
-
 function normalize(v) {
   const mag = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
   return mag === 0 ? v : v.map(x => x / mag);
 }
-
 function averageEmbeddings(embs) {
   const len = embs[0].length;
   const avg = new Array(len).fill(0);
@@ -127,7 +132,6 @@ function averageEmbeddings(embs) {
   for (let i = 0; i < len; i++) avg[i] /= embs.length;
   return normalize(avg);
 }
-
 function weightedCombine(a, b, wa, wb) {
   return normalize(a.map((x, i) => wa * x + wb * b[i]));
 }
@@ -136,20 +140,14 @@ function weightedCombine(a, b, wa, wb) {
 function chunkText(text, maxChars = 400) {
   if (!text || text.length <= maxChars) return [text || ''];
   const sentences = text.match(/[^.!?\n]+[.!?\n]*/g) || [text];
-  const chunks = [];
-  let current = '';
+  const chunks = []; let current = '';
   for (const s of sentences) {
-    if ((current + s).length > maxChars && current.length > 0) {
-      chunks.push(current.trim());
-      current = s;
-    } else {
-      current += s;
-    }
+    if ((current + s).length > maxChars && current.length > 0) { chunks.push(current.trim()); current = s; }
+    else current += s;
   }
   if (current.trim()) chunks.push(current.trim());
   return chunks.length ? chunks : [text];
 }
-
 async function embedWithChunking(text) {
   const chunks = chunkText(text);
   const embs = await Promise.all(chunks.map(async c => {
@@ -172,8 +170,7 @@ inputExcel.addEventListener('change', async e => {
     pageNumber: Number(r['Page Number']) || 0,
     topic:      String(r['Topic']  || ''),
     detail:     String(r['Detail'] || ''),
-    embedding:  null,
-    score:      0,
+    embedding:  null, score: 0,
   }));
 
   progressWrap.style.display = 'block';
@@ -186,10 +183,7 @@ inputExcel.addEventListener('change', async e => {
   }
   progressWrap.style.display = 'none';
   checkSearchReady();
-
-  if (sessionDirHandle && pdfDoc && currentPdfFile) {
-    await saveSession(currentPdfFile);
-  }
+  if (sessionDirHandle && pdfDoc && currentPdfFile) await saveSession(currentPdfFile);
 });
 
 // ─── PDF UPLOAD ───────────────────────────────────────────────────────────────
@@ -206,112 +200,187 @@ async function loadPDF(file) {
   const ab = await file.arrayBuffer();
   pdfDoc = await pdfjsLib.getDocument({ data: ab }).promise;
   totalPages = pdfDoc.numPages;
+
+  // Measure base page size at scale 1.0
+  const p1   = await pdfDoc.getPage(1);
+  const base = p1.getViewport({ scale: 1.0 });
+  basePageWidth  = base.width;
+  basePageHeight = base.height;
+
+  // Set initial scale = fit-to-width
+  currentScale = calcFitScale();
+  updateZoomDisplay();
+
   pdfPlaceholder.style.display = 'none';
   btnFullscreen.disabled = false;
-  await setupScrollView();
-  await renderAllThumbnails();
-  navigateToPage(1, false);
+  btnZoomIn.disabled     = false;
+  btnZoomOut.disabled    = false;
+  btnZoomFit.disabled    = false;
+
+  await buildScrollView();
+  buildThumbnailStrip();     // creates items immediately, renders async
+  navigateToPage(1, false);  // scroll to top
+  renderPagesProgressively(); // fills canvases page-by-page
+
   checkSearchReady();
 }
 
-// ─── PDF SCROLL VIEW SETUP ────────────────────────────────────────────────────
-async function setupScrollView() {
-  if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
-  if (renderObserver) { renderObserver.disconnect(); renderObserver = null; }
+// ─── FIT-TO-WIDTH SCALE ───────────────────────────────────────────────────────
+function calcFitScale() {
+  const available = pdfScrollView.clientWidth - 40; // 20px padding each side
+  if (!basePageWidth || available <= 0) return 1.5;
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, available / basePageWidth));
+}
+
+function updateZoomDisplay() {
+  zoomDisplay.textContent = Math.round(currentScale * 100) + '%';
+}
+
+// ─── BUILD SCROLL VIEW (creates wrappers with correctly-sized canvases) ───────
+async function buildScrollView() {
+  // Cancel any in-progress page rendering
+  if (pageRenderTask) pageRenderTask.cancelled = true;
 
   pdfScrollView.innerHTML = '';
   pageWrappers = [];
 
-  // Track which page is most visible → update page info + thumbnail highlight
-  scrollObserver = new IntersectionObserver(entries => {
-    let best = null, bestRatio = 0;
-    entries.forEach(e => {
-      if (e.isIntersecting && e.intersectionRatio > bestRatio) {
-        bestRatio = e.intersectionRatio;
-        best = e.target;
-      }
-    });
-    if (best) {
-      const p = parseInt(best.dataset.page);
-      if (p !== currentPage) {
-        currentPage = p;
-        updatePageInfo();
-        highlightThumb(currentPage);
-        syncThumbScroll(currentPage);
-      }
-    }
-  }, { root: pdfScrollView, threshold: [0.1, 0.3, 0.5, 0.7] });
-
-  // Lazy-render pages as they approach the viewport
-  renderObserver = new IntersectionObserver(async entries => {
-    for (const e of entries) {
-      if (!e.isIntersecting) continue;
-      const i = parseInt(e.target.dataset.page) - 1;
-      const pw = pageWrappers[i];
-      if (pw && !pw.rendered) {
-        pw.rendered = true;
-        await renderPageToCanvas(i + 1, pw.canvas, MAIN_SCALE);
-      }
-    }
-  }, { root: pdfScrollView, rootMargin: '400px' });
-
-  // Use first page dimensions as placeholder size for all canvases
-  const firstPage = await pdfDoc.getPage(1);
-  const firstVP   = firstPage.getViewport({ scale: MAIN_SCALE });
+  // Pre-calculate all page sizes to avoid layout shift during rendering
+  // Use first page dimensions for all (uniform slide decks); resize on render
+  const vp = (await pdfDoc.getPage(1)).getViewport({ scale: currentScale });
 
   for (let p = 1; p <= totalPages; p++) {
     const wrapper = document.createElement('div');
     wrapper.className = 'page-wrapper';
     wrapper.dataset.page = p;
+
     const canvas = document.createElement('canvas');
-    canvas.width  = firstVP.width;
-    canvas.height = firstVP.height;
+    canvas.width  = Math.round(vp.width);
+    canvas.height = Math.round(vp.height);
+    // Draw a subtle loading background
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#f0f0f0';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
     wrapper.appendChild(canvas);
     pdfScrollView.appendChild(wrapper);
     pageWrappers.push({ wrapper, canvas, rendered: false });
-    scrollObserver.observe(wrapper);
-    renderObserver.observe(wrapper);
   }
+
+  // Scroll-based page tracking
+  pdfScrollView.removeEventListener('scroll', onPdfScroll);
+  pdfScrollView.addEventListener('scroll', onPdfScroll, { passive: true });
 }
 
-// ─── THUMBNAIL STRIP ──────────────────────────────────────────────────────────
-async function renderAllThumbnails() {
-  if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
-  thumbnailStrip.innerHTML = '';
-
-  // Lazy-render thumbnails as they scroll into view in the strip
-  thumbObserver = new IntersectionObserver(async entries => {
-    for (const e of entries) {
-      if (!e.isIntersecting || e.target.dataset.rendered) continue;
-      e.target.dataset.rendered = '1';
-      const p      = parseInt(e.target.dataset.page);
-      const canvas = e.target.querySelector('canvas');
-      await renderPageToCanvas(p, canvas, THUMB_SCALE);
-    }
-  }, { root: thumbnailStrip, rootMargin: '300px' });
+// ─── PROGRESSIVE PAGE RENDERING ───────────────────────────────────────────────
+async function renderPagesProgressively() {
+  const task = { cancelled: false };
+  pageRenderTask = task;
 
   for (let p = 1; p <= totalPages; p++) {
-    const item   = document.createElement('div');
-    item.className = 'thumb-item';
-    item.dataset.page = p;
-    const canvas = document.createElement('canvas');
-    const label  = document.createElement('span');
-    label.textContent = p;
-    item.appendChild(canvas);
-    item.appendChild(label);
-    item.addEventListener('click', () => navigateToPage(p));
-    thumbnailStrip.appendChild(item);
-    thumbObserver.observe(item);
+    if (task.cancelled) break;
+    const pw = pageWrappers[p - 1];
+    if (pw && !pw.rendered) {
+      pw.rendered = true;
+      await renderPageToCanvas(p, pw.canvas, currentScale);
+    }
+    // Yield to browser so UI stays responsive
+    await new Promise(r => setTimeout(r, 0));
   }
 }
 
 // ─── SHARED RENDER HELPER ────────────────────────────────────────────────────
 async function renderPageToCanvas(pageNum, canvas, scale) {
-  const page = await pdfDoc.getPage(pageNum);
-  const vp   = page.getViewport({ scale });
-  canvas.width  = vp.width;
-  canvas.height = vp.height;
-  await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+  try {
+    const page = await pdfDoc.getPage(pageNum);
+    const vp   = page.getViewport({ scale });
+    canvas.width  = Math.round(vp.width);
+    canvas.height = Math.round(vp.height);
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+  } catch (e) {
+    // Page render failed — leave the placeholder background
+    console.warn(`Page ${pageNum} render failed:`, e);
+  }
+}
+
+// ─── THUMBNAIL STRIP ──────────────────────────────────────────────────────────
+function buildThumbnailStrip() {
+  if (thumbRenderTask) thumbRenderTask.cancelled = true;
+  thumbnailStrip.innerHTML = '';
+
+  const aspect = basePageHeight > 0 ? basePageHeight / basePageWidth : 0.75;
+  const thumbW = 92;
+  const thumbH = Math.round(thumbW * aspect);
+
+  for (let p = 1; p <= totalPages; p++) {
+    const item  = document.createElement('div');
+    item.className  = 'thumb-item';
+    item.dataset.page = p;
+
+    // Placeholder shown until canvas renders
+    const placeholder = document.createElement('div');
+    placeholder.className = 'thumb-placeholder';
+    placeholder.style.width  = thumbW + 'px';
+    placeholder.style.height = thumbH + 'px';
+
+    const canvas = document.createElement('canvas');
+    canvas.style.display = 'none'; // hidden until rendered
+
+    const num = document.createElement('span');
+    num.className   = 'thumb-num';
+    num.textContent = p;
+
+    item.appendChild(placeholder);
+    item.appendChild(canvas);
+    item.appendChild(num);
+    item.addEventListener('click', () => navigateToPage(p));
+    thumbnailStrip.appendChild(item);
+  }
+
+  // Render thumbnails progressively in the background
+  const task = { cancelled: false };
+  thumbRenderTask = task;
+  renderThumbnailsAsync(task);
+}
+
+async function renderThumbnailsAsync(task) {
+  const items = thumbnailStrip.querySelectorAll('.thumb-item');
+  for (let i = 0; i < items.length; i++) {
+    if (task.cancelled) break;
+    const item        = items[i];
+    const p           = parseInt(item.dataset.page);
+    const canvas      = item.querySelector('canvas');
+    const placeholder = item.querySelector('.thumb-placeholder');
+
+    await renderPageToCanvas(p, canvas, THUMB_SCALE);
+
+    if (!task.cancelled) {
+      placeholder.style.display = 'none';
+      canvas.style.display      = 'block';
+    }
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+
+// ─── SCROLL-BASED PAGE TRACKING ───────────────────────────────────────────────
+function onPdfScroll() {
+  if (!pageWrappers.length) return;
+  const cr     = pdfScrollView.getBoundingClientRect();
+  const viewMid = cr.height / 2;
+
+  let closest = 0, closestDist = Infinity;
+  for (let i = 0; i < pageWrappers.length; i++) {
+    const wr   = pageWrappers[i].wrapper.getBoundingClientRect();
+    const dist = Math.abs((wr.top - cr.top + wr.height / 2) - viewMid);
+    if (dist < closestDist) { closestDist = dist; closest = i; }
+  }
+
+  const newPage = closest + 1;
+  if (newPage !== currentPage) {
+    currentPage = newPage;
+    updatePageInfo();
+    highlightThumb(currentPage);
+    syncThumbScroll(currentPage);
+  }
 }
 
 // ─── PAGE NAVIGATION ──────────────────────────────────────────────────────────
@@ -319,10 +388,9 @@ function navigateToPage(pageNum, smooth = true) {
   if (!pdfDoc || !pageWrappers.length) return;
   currentPage = Math.max(1, Math.min(pageNum, totalPages));
   const wrapper = pageWrappers[currentPage - 1].wrapper;
-  // Scroll within the pdfScrollView container directly
-  const containerRect = pdfScrollView.getBoundingClientRect();
-  const wrapperRect   = wrapper.getBoundingClientRect();
-  const offset = wrapperRect.top - containerRect.top + pdfScrollView.scrollTop - 16;
+  const cr      = pdfScrollView.getBoundingClientRect();
+  const wr      = wrapper.getBoundingClientRect();
+  const offset  = wr.top - cr.top + pdfScrollView.scrollTop - 20;
   pdfScrollView.scrollTo({ top: offset, behavior: smooth ? 'smooth' : 'instant' });
   updatePageInfo();
   highlightThumb(currentPage);
@@ -330,7 +398,7 @@ function navigateToPage(pageNum, smooth = true) {
 }
 
 function updatePageInfo() {
-  if (!pageInfo.isConnected) return; // input is showing instead
+  if (!pageInfo.isConnected) return;
   pageInfo.textContent = `${currentPage} / ${totalPages}`;
 }
 
@@ -345,22 +413,41 @@ function syncThumbScroll(pageNum) {
   if (!t) return;
   const cr = thumbnailStrip.getBoundingClientRect();
   const tr = t.getBoundingClientRect();
-  const offset = tr.top - cr.top + thumbnailStrip.scrollTop - thumbnailStrip.clientHeight / 2;
-  thumbnailStrip.scrollTo({ top: offset, behavior: 'smooth' });
+  const mid = tr.top - cr.top + thumbnailStrip.scrollTop - thumbnailStrip.clientHeight / 2 + tr.height / 2;
+  thumbnailStrip.scrollTo({ top: mid, behavior: 'smooth' });
 }
+
+// ─── ZOOM ─────────────────────────────────────────────────────────────────────
+async function applyZoom(newScale) {
+  currentScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newScale));
+  updateZoomDisplay();
+  const savedPage = currentPage;
+  await buildScrollView();
+  navigateToPage(savedPage, false);
+  renderPagesProgressively();
+}
+
+btnZoomIn.addEventListener('click',  () => applyZoom(currentScale * ZOOM_STEP));
+btnZoomOut.addEventListener('click', () => applyZoom(currentScale / ZOOM_STEP));
+btnZoomFit.addEventListener('click', () => applyZoom(calcFitScale()));
+zoomDisplay.addEventListener('click', () => applyZoom(calcFitScale()));
+
+// Re-fit when window resizes
+window.addEventListener('resize', () => {
+  if (!pdfDoc) return;
+  // Only auto-refit if user is at (or close to) fit-to-width
+  const fitScale = calcFitScale();
+  if (Math.abs(currentScale - fitScale) < 0.05) applyZoom(fitScale);
+});
 
 // ─── EDITABLE PAGE NUMBER ─────────────────────────────────────────────────────
 pageInfo.addEventListener('click', () => {
   if (!pdfDoc) return;
   const input = document.createElement('input');
-  input.type = 'number';
-  input.min  = 1;
-  input.max  = totalPages;
-  input.value = currentPage;
-  input.className = 'page-input-edit';
+  input.type = 'number'; input.min = 1; input.max = totalPages;
+  input.value = currentPage; input.className = 'page-input-edit';
   pageInfo.replaceWith(input);
-  input.focus();
-  input.select();
+  input.focus(); input.select();
 
   const commit = () => {
     const n = parseInt(input.value);
@@ -386,12 +473,16 @@ btnFullscreen.addEventListener('click', async () => {
   fsBtnPrev.disabled = currentPage <= 1;
   fsBtnNext.disabled = currentPage >= totalPages;
   fsPageInfo.textContent = `${currentPage} / ${totalPages}`;
-  await renderPageToCanvas(currentPage, fsCanvas, 1.8);
+  await renderPageToCanvas(currentPage, fsCanvas, calcFsScale());
 });
+fsBtnClose.addEventListener('click', () => { fullscreenOverlay.style.display = 'none'; });
 
-fsBtnClose.addEventListener('click', () => {
-  fullscreenOverlay.style.display = 'none';
-});
+function calcFsScale() {
+  const w = window.innerWidth  - 48;
+  const h = window.innerHeight - 80;
+  if (!basePageWidth) return 1.8;
+  return Math.min(w / basePageWidth, h / basePageHeight, 3.0);
+}
 
 async function fsNavigate(delta) {
   const next = Math.max(1, Math.min(currentPage + delta, totalPages));
@@ -400,7 +491,7 @@ async function fsNavigate(delta) {
   fsBtnPrev.disabled = currentPage <= 1;
   fsBtnNext.disabled = currentPage >= totalPages;
   fsPageInfo.textContent = `${currentPage} / ${totalPages}`;
-  await renderPageToCanvas(currentPage, fsCanvas, 1.8);
+  await renderPageToCanvas(currentPage, fsCanvas, calcFsScale());
   updatePageInfo();
   highlightThumb(currentPage);
 }
@@ -415,14 +506,16 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { fullscreenOverlay.style.display = 'none'; return; }
   if (!inInput) {
     const isFS = fullscreenOverlay.style.display !== 'none';
-    if (e.key === 'ArrowLeft')  { if (isFS) fsNavigate(-1); else navigateToPage(currentPage - 1); }
-    if (e.key === 'ArrowRight') { if (isFS) fsNavigate(1);  else navigateToPage(currentPage + 1); }
+    if (e.key === 'ArrowLeft')  { isFS ? fsNavigate(-1) : navigateToPage(currentPage - 1); }
+    if (e.key === 'ArrowRight') { isFS ? fsNavigate(1)  : navigateToPage(currentPage + 1); }
+    if ((e.ctrlKey || e.metaKey) && e.key === '=') { e.preventDefault(); applyZoom(currentScale * ZOOM_STEP); }
+    if ((e.ctrlKey || e.metaKey) && e.key === '-') { e.preventDefault(); applyZoom(currentScale / ZOOM_STEP); }
+    if ((e.ctrlKey || e.metaKey) && e.key === '0') { e.preventDefault(); applyZoom(calcFitScale()); }
   }
 });
 
-// Digit accumulation → jump to page (when outside search input)
-let jumpBuffer = '';
-let jumpTimer  = null;
+// Digit accumulation → jump to page
+let jumpBuffer = '', jumpTimer = null;
 document.addEventListener('keydown', e => {
   if (document.activeElement === searchInput) return;
   if (/^\d$/.test(e.key)) {
@@ -456,8 +549,7 @@ btnSearch.addEventListener('click', runSearch);
 function keywordScore(query, text) {
   const qWords = new Set(query.toLowerCase().split(/\s+/).filter(Boolean));
   if (!qWords.size) return 0;
-  const tWords = text.toLowerCase().split(/\s+/);
-  const hits = tWords.filter(w => qWords.has(w)).length;
+  const hits = text.toLowerCase().split(/\s+/).filter(w => qWords.has(w)).length;
   return hits / qWords.size;
 }
 
@@ -487,8 +579,7 @@ async function runSearch() {
 function renderTable(sorted) {
   const minScore = parseInt(scoreSlider.value) / 100;
   const topN     = parseInt(topNSelect.value);
-
-  let filtered = sorted.filter(r => r.score >= minScore);
+  let filtered   = sorted.filter(r => r.score >= minScore);
   if (topN > 0) filtered = filtered.slice(0, topN);
 
   resultsBody.innerHTML = '';
@@ -497,28 +588,23 @@ function renderTable(sorted) {
   filtered.forEach(row => {
     const tr = document.createElement('tr');
     tr.dataset.page = row.pageNumber;
-
     const scorePct   = Math.round(row.score * 100);
     const badgeClass = scorePct >= 80 ? 'score-green' : scorePct >= 60 ? 'score-yellow' : 'score-gray';
-
     tr.innerHTML = `
       <td class="td-page">${row.pageNumber}</td>
       <td class="td-topic">${escHtml(row.topic)}</td>
       <td class="td-detail"><div class="detail-cell collapsed">${escHtml(row.detail)}</div></td>
       <td><span class="score-badge ${badgeClass}">${scorePct}%</span></td>
     `;
-
     tr.addEventListener('click', () => {
       document.querySelectorAll('#resultsBody tr').forEach(t => t.classList.remove('active'));
       tr.classList.add('active');
       navigateToPage(row.pageNumber);
     });
-
     tr.querySelector('.detail-cell').addEventListener('click', e => {
       e.stopPropagation();
       e.currentTarget.classList.toggle('collapsed');
     });
-
     resultsBody.appendChild(tr);
   });
 }
@@ -540,21 +626,16 @@ function loadHistory() {
   try { return JSON.parse(localStorage.getItem(LS_HISTORY) || '[]'); } catch { return []; }
 }
 function saveHistory(h) { localStorage.setItem(LS_HISTORY, JSON.stringify(h)); }
-
 function addHistory(query) {
   let h = loadHistory().filter(q => q !== query);
-  h.unshift(query);
-  h = h.slice(0, 5);
-  saveHistory(h);
-  renderHistory();
+  h.unshift(query); h = h.slice(0, 5);
+  saveHistory(h); renderHistory();
 }
-
 function renderHistory() {
   historyChips.innerHTML = '';
   loadHistory().forEach(q => {
     const chip = document.createElement('button');
-    chip.className = 'history-chip';
-    chip.textContent = q;
+    chip.className = 'history-chip'; chip.textContent = q;
     chip.addEventListener('click', () => { searchInput.value = q; runSearch(); });
     historyChips.appendChild(chip);
   });
@@ -569,17 +650,14 @@ function openIDB() {
     req.onerror   = () => rej(req.error);
   });
 }
-
 async function persistHandleToIDB(handle) {
   const db = await openIDB();
   return new Promise((res, rej) => {
     const tx = db.transaction(IDB_STORE, 'readwrite');
     tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
-    tx.oncomplete = res;
-    tx.onerror    = () => rej(tx.error);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
   });
 }
-
 async function loadHandleFromIDB() {
   const db = await openIDB();
   return new Promise((res, rej) => {
@@ -589,7 +667,6 @@ async function loadHandleFromIDB() {
     req.onerror   = () => rej(req.error);
   });
 }
-
 async function tryRestoreSessionFolder() {
   const handle = await loadHandleFromIDB();
   if (!handle) return;
@@ -600,7 +677,7 @@ async function tryRestoreSessionFolder() {
       folderHint.textContent = handle.name;
       await loadSessionList();
     }
-  } catch { /* permission denied or stale handle */ }
+  } catch { /* stale handle */ }
 }
 
 btnSetFolder.addEventListener('click', async () => {
@@ -609,7 +686,7 @@ btnSetFolder.addEventListener('click', async () => {
     await persistHandleToIDB(sessionDirHandle);
     folderHint.textContent = sessionDirHandle.name;
     await loadSessionList();
-  } catch { /* user cancelled */ }
+  } catch { /* cancelled */ }
 });
 
 async function saveSession(pdfFile) {
@@ -618,19 +695,15 @@ async function saveSession(pdfFile) {
   const date = new Date().toISOString().slice(0, 10);
   const name = `${base}_${date}`;
   try {
-    const subDir = await sessionDirHandle.getDirectoryHandle(name, { create: true });
+    const subDir    = await sessionDirHandle.getDirectoryHandle(name, { create: true });
     const pdfHandle = await subDir.getFileHandle(pdfFile.name, { create: true });
     const pdfWriter = await pdfHandle.createWritable();
-    await pdfWriter.write(pdfFile);
-    await pdfWriter.close();
+    await pdfWriter.write(pdfFile); await pdfWriter.close();
     const jsonHandle = await subDir.getFileHandle('session.json', { create: true });
     const jsonWriter = await jsonHandle.createWritable();
     await jsonWriter.write(JSON.stringify({
-      version: 1,
-      createdAt: new Date().toISOString(),
-      pdfFilename: pdfFile.name,
-      modelId: MODEL_ID,
-      rows,
+      version: 1, createdAt: new Date().toISOString(),
+      pdfFilename: pdfFile.name, modelId: MODEL_ID, rows,
     }));
     await jsonWriter.close();
     await loadSessionList();
@@ -647,7 +720,7 @@ async function loadSessionList() {
       const jsonFile = await (await handle.getFileHandle('session.json')).getFile();
       const meta = JSON.parse(await jsonFile.text());
       sessions.push({ name, handle, meta });
-    } catch { /* skip invalid folders */ }
+    } catch { /* skip */ }
   }
   sessions.sort((a, b) => b.meta.createdAt.localeCompare(a.meta.createdAt));
   renderSessionCards(sessions);
@@ -667,7 +740,7 @@ function renderSessionCards(sessions) {
     card.className = 'session-card';
     card.innerHTML = `
       <div class="session-info">
-        <span class="session-name" data-folder="${entry.name}">${entry.name}</span>
+        <span class="session-name">${entry.name}</span>
         <span class="session-date">${date}</span>
         <span class="session-model">${entry.meta.modelId || ''}</span>
       </div>
@@ -676,21 +749,15 @@ function renderSessionCards(sessions) {
         <button class="btn-load">&#9654; Load</button>
       </div>
     `;
-
     card.querySelector('.btn-load').addEventListener('click', async () => {
-      await resumeSession(entry);
-      sessionsModal.style.display = 'none';
+      await resumeSession(entry); sessionsModal.style.display = 'none';
     });
-
     card.querySelector('.btn-rename').addEventListener('click', async () => {
       const nameEl = card.querySelector('.session-name');
-      const old = nameEl.textContent;
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.value = old;
-      input.className = 'rename-input';
-      nameEl.replaceWith(input);
-      input.focus();
+      const old    = nameEl.textContent;
+      const input  = document.createElement('input');
+      input.type = 'text'; input.value = old; input.className = 'rename-input';
+      nameEl.replaceWith(input); input.focus();
       const commit = async () => {
         const newName = input.value.trim();
         if (newName && newName !== old) {
@@ -698,19 +765,16 @@ function renderSessionCards(sessions) {
             const newDir = await sessionDirHandle.getDirectoryHandle(newName, { create: true });
             for await (const [fname, fhandle] of entry.handle.entries()) {
               if (fhandle.kind !== 'file') continue;
-              const file = await fhandle.getFile();
+              const file  = await fhandle.getFile();
               const newFH = await newDir.getFileHandle(fname, { create: true });
-              const w = await newFH.createWritable();
-              await w.write(file);
-              await w.close();
+              const w     = await newFH.createWritable();
+              await w.write(file); await w.close();
               await entry.handle.removeEntry(fname);
             }
             await sessionDirHandle.removeEntry(old);
             await loadSessionList();
           } catch (e) { showToast('Rename failed: ' + e.message, true); }
-        } else {
-          input.replaceWith(nameEl);
-        }
+        } else { input.replaceWith(nameEl); }
       };
       input.addEventListener('blur', commit);
       input.addEventListener('keydown', e => {
@@ -718,14 +782,13 @@ function renderSessionCards(sessions) {
         if (e.key === 'Escape') input.replaceWith(nameEl);
       });
     });
-
     sessionList.appendChild(card);
   });
 }
 
 async function resumeSession(entry) {
   if (entry.meta.modelId && entry.meta.modelId !== MODEL_ID) {
-    showToast(`Session created with ${entry.meta.modelId}. Search scores may be inaccurate.`, true);
+    showToast(`Session created with ${entry.meta.modelId}. Scores may be inaccurate.`, true);
   }
   try {
     const pdfFile = await (await entry.handle.getFileHandle(entry.meta.pdfFilename)).getFile();
