@@ -26,7 +26,7 @@ STARTING THE APP
 ------------------------------------------------------------
 
   Double-click: start.bat
-  Browser opens at http://localhost:8082 automatically.
+  Browser opens at http://localhost:8083 automatically.
 
 ------------------------------------------------------------
 FEATURES
