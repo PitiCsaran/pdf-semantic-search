@@ -113,7 +113,7 @@ async function initModel() {
     embedder = await pipeline('feature-extraction', MODEL_ID, { quantized: true });
     setStatus('Model ready — upload PDF and Excel to begin', 'ready');
   } catch (e) {
-    setStatus('Model failed to load. Run download_model.bat first.', 'error');
+    setStatus('Model error: ' + (e.message || String(e)), 'error');
     console.error(e);
   }
 }
