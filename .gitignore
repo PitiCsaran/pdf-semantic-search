@@ -2,6 +2,7 @@
 v1/L12-v2/model/
 v1/LaBSE/model/
 v2/**/model/
+v2/**/tessdata/
 
 # User session data
 *.pdf
